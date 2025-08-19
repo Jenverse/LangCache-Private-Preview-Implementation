@@ -1,43 +1,69 @@
 from flask import Flask, render_template, request, jsonify
 import time
-import random
-import json
 import os
 import requests
+from requests import Response
+from requests.adapters import HTTPAdapter
 import datetime
 import statistics
 from collections import defaultdict
 from dotenv import load_dotenv
 from google import genai
+from openai import OpenAI
 from log_manager import log_manager
+import logging
+from tenacity import Retrying, stop_after_attempt, wait_exponential, retry_if_exception_type, retry
 
 # Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
+logger = logging.getLogger('gunicorn.error')
+app.logger.handlers = logger.handlers
+app.logger.setLevel(logger.level)
+
+session = requests.Session()
+adapter = HTTPAdapter()
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
 # Initialize the Gemini API client
 # You would need to set your API key as an environment variable or replace directly here
 API_KEY = os.environ.get('GEMINI_API_KEY', 'YOUR_API_KEY_HERE')
-genai_client = genai.Client(api_key=API_KEY)
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', 'YOUR_API_KEY_HERE')
+if API_KEY:
+    genai_client = genai.Client(
+        api_key=API_KEY
+    )
+else:
+    genai_client = None
 
-
+if OPENAI_API_KEY:
+    openai_client = OpenAI(
+        api_key=OPENAI_API_KEY
+    )
+else:
+    openai_client = None
 
 # Redis Langcache API configuration
 LANGCACHE_INDEX_NAME = 'gemini_cache'
 
 # Define URLs for different embedding models
 LANGCACHE_URLS = {
-    'ollama-bge': 'http://langcache-ollama:8080',
+    'ollama-bge': 'http://langcache-redis:8080',
     'redis-langcache': 'http://langcache-redis:8080',
-    'openai-embeddings': 'http://langcache-openai:8080'
+    'openai-embeddings': 'http://langcache-redis:8080',
 }
 
 # Enable debug mode
 DEBUG = True
 
 # Define cache IDs for different embedding models
-cache_ids = {}
+cache_ids = {
+    'ollama-bge': 'ollamaCache',
+    'redis-langcache': 'redisCache',
+    'openai-embeddings': 'openaiCache'
+}
 # Default embedding model
 DEFAULT_EMBEDDING_MODEL = 'redis-langcache'
 
@@ -81,25 +107,30 @@ operations_log = {
 
 # Query match tracking
 query_matches = []
-# Format: [
-#   {
-#     'timestamp': '2025-04-04 12:00',
-#     'query': 'user query',
-#     'matched_query': 'cache query',
-#     'model': 'embedding model name',
-#     'similarity': 0.95,
-#     'embedding_time': 0.5,  # seconds
-#     'cache_id': 'cache entry id'
-#   },
-#   ...
-# ]
 
 # Cache queries for n-gram analysis
 cached_queries = {}
-# Format: {
-#   'cache_id': 'query text',
-#   ...
-# }
+
+retryer = Retrying(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.5, max=5),
+    retry=retry_if_exception_type(
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        )
+    )
+)
+
+def rest_post(
+        url: str,
+        data: dict,
+        timeout: int = 5
+) -> Response:
+    response = session.post(url, json=data, timeout=timeout)
+    response.raise_for_status()
+    return response
 
 def get_current_timestamp():
     """Get current timestamp in format 'YYYY-MM-DD HH:MM' rounded to nearest 15 min"""
@@ -115,10 +146,10 @@ def create_cache():
     global cache_ids
 
     if DEBUG:
-        print(f"DEBUG: Starting create_cache with LANGCACHE_URLS: {LANGCACHE_URLS}")
+        app.logger.info(f"DEBUG: Starting create_cache with LANGCACHE_URLS: {LANGCACHE_URLS}")
 
     for model_name, base_url in LANGCACHE_URLS.items():
-        url = f"{base_url}/v1/admin/caches"
+        url = f"{base_url}/v1/caches"
         payload = {
             "indexName": f"{LANGCACHE_INDEX_NAME}_{model_name}",
             "redisUrls": ["redis://cache:6379"],
@@ -128,23 +159,23 @@ def create_cache():
         }
 
         if DEBUG:
-            print(f"DEBUG: Creating cache for {model_name} at URL: {url}")
-            print(f"DEBUG: Payload: {payload}")
+            app.logger.info(f"DEBUG: Creating cache for {model_name} at URL: {url}")
+            app.logger.info(f"DEBUG: Payload: {payload}")
 
         try:
-            print(f"Creating cache for {model_name} at {base_url}...")
+            app.logger.info(f"Creating cache for {model_name} at {base_url}...")
             response = requests.post(url, json=payload)
             if response.status_code == 200 or response.status_code == 201:
                 data = response.json()
                 cache_id = data.get('cacheId')
                 cache_ids[model_name] = cache_id
-                print(f"Cache for {model_name} created with ID: {cache_id}")
+                app.logger.info(f"Cache for {model_name} created with ID: {cache_id}")
                 # Log cache creation event
                 log_manager.log_cache_creation(cache_id, model_name)
             else:
-                print(f"Error creating cache for {model_name}: {response.status_code} - {response.text}")
+                app.logger.error(f"Error creating cache for {model_name}: {response.status_code} - {response.text}")
         except Exception as e:
-            print(f"Error creating cache for {model_name}: {e}")
+            app.logger.error(f"Error creating cache for {model_name}: {e}")
 
     # Return True if at least one cache was created successfully
     return len(cache_ids) > 0
@@ -154,9 +185,9 @@ def search_cache(query, embedding_model="redis-langcache"):
     global operations_log
 
     if DEBUG:
-        print(f"DEBUG: Starting search_cache for query: '{query}' with model: {embedding_model}")
-        print(f"DEBUG: Current cache_ids: {cache_ids}")
-        print(f"DEBUG: Current LANGCACHE_URLS: {LANGCACHE_URLS}")
+        app.logger.info(f"DEBUG: Starting search_cache for query: '{query}' with model: {embedding_model}")
+        app.logger.info(f"DEBUG: Current cache_ids: {cache_ids}")
+        app.logger.info(f"DEBUG: Current LANGCACHE_URLS: {LANGCACHE_URLS}")
 
     # Reset operations log for new query
     operations_log = {
@@ -180,7 +211,7 @@ def search_cache(query, embedding_model="redis-langcache"):
     # Get the cache ID for the selected embedding model
     cache_id = cache_ids.get(embedding_model)
     if not cache_id:
-        print(f"No cache_id available for {embedding_model}, skipping cache search")
+        app.logger.warning(f"No cache_id available for {embedding_model}, skipping cache search")
         operations_log['steps'].append({
             'step': 'ERROR',
             'timestamp': datetime.datetime.now().strftime('%H:%M:%S'),
@@ -196,7 +227,7 @@ def search_cache(query, embedding_model="redis-langcache"):
     # Get the base URL for the selected embedding model
     base_url = LANGCACHE_URLS.get(embedding_model)
     if not base_url:
-        print(f"No base URL available for {embedding_model}, skipping cache search")
+        app.logger.warning(f"No base URL available for {embedding_model}, skipping cache search")
         operations_log['steps'].append({
             'step': 'ERROR',
             'timestamp': datetime.datetime.now().strftime('%H:%M:%S'),
@@ -206,17 +237,18 @@ def search_cache(query, embedding_model="redis-langcache"):
         })
         return None
 
-    url = f"{base_url}/v1/caches/{cache_id}/search"
+    url = f"{base_url}/v1/caches/{cache_id}/entries/search"
     payload = {
         "prompt": query,
-        "similarityThreshold": 0.85  # Updated threshold as requested
+        "similarityThreshold": 0.85,
+        "attributes": {
+            "language": "en",
+            "topic": "ai"
+        }
     }
 
-    # Track embedding generation time separately
-    embedding_start_time = time.time()
-
     try:
-        print(f"Searching cache for query: {query} with model: {embedding_model}")
+        app.logger.info(f"Searching cache for query: {query} with model: {embedding_model}")
 
         # Log embedding generation step
         operations_log['steps'].append({
@@ -230,8 +262,20 @@ def search_cache(query, embedding_model="redis-langcache"):
         })
 
         # First part: Generate embeddings and send request
-        response = requests.post(url, json=payload)
-        embedding_time = time.time() - embedding_start_time
+        try:
+            app.logger.info(f"Search: Attempting to POST to {url}")
+            embedding_start_time = time.time()
+            response = retryer(rest_post, url, payload, 5)
+            embedding_time = time.time() - embedding_start_time
+        except requests.exceptions.Timeout:
+            app.logger.error(f"Timeout when calling {url}")
+            return None
+        except requests.exceptions.ConnectionError:
+            app.logger.error(f"Connection error when calling {url}")
+            return None
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"Error when calling {url}: {e}")
+            return None
 
         # Second part: Process response (Redis search time)
         redis_search_start_time = time.time()
@@ -253,23 +297,23 @@ def search_cache(query, embedding_model="redis-langcache"):
             }
         })
 
-        print(f"Cache search response status: {response.status_code}")
+        app.logger.info(f"Cache search response status: {response.status_code}")
 
         if response.status_code == 200:
             try:
                 data = response.json()
-                print(f"Cache search response data: {data}")
+                app.logger.info(f"Cache search response data: {data}")
 
                 # According to the API spec, the response is an array of entries
-                if data and len(data) > 0:
+                if data and len(data.get('data', [])) > 0:
                     # Return the most similar entry (first one)
-                    entry = data[0]
+                    entry = data.get('data')[0]
                     similarity = entry['similarity']
-                    print(f"Cache hit found with similarity: {similarity}")
+                    app.logger.info(f"Cache hit found with similarity: {similarity}")
 
                     # Calculate Redis search time
                     redis_search_time = time.time() - redis_search_start_time
-                    print(f"Redis search processing time: {redis_search_time:.6f}s (excluding embedding generation)")
+                    app.logger.info(f"Redis search processing time: {redis_search_time:.6f}s (excluding embedding generation)")
 
                     # Track Redis search time for the specific embedding model
                     latency_data[embedding_model]['redis'][timestamp].append(redis_search_time)
@@ -318,7 +362,7 @@ def search_cache(query, embedding_model="redis-langcache"):
                         'redis_search_time': redis_search_time
                     }
                 else:
-                    print("No similar entries found in cache")
+                    app.logger.info("No similar entries found in cache")
 
                     # Calculate Redis search time
                     redis_search_time = time.time() - redis_search_start_time
@@ -342,8 +386,8 @@ def search_cache(query, embedding_model="redis-langcache"):
                         'total_time': embedding_time + redis_search_time
                     }
             except ValueError as json_error:
-                print(f"Error parsing JSON response: {json_error}")
-                print(f"Response content: {response.text[:100]}...")
+                app.logger.error(f"Error parsing JSON response: {json_error}")
+                app.logger.error(f"Response content: {response.text[:100]}...")
                 # Calculate Redis search time for error case
                 redis_search_time = time.time() - redis_search_start_time
                 return {
@@ -351,10 +395,10 @@ def search_cache(query, embedding_model="redis-langcache"):
                     'redis_search_time': redis_search_time
                 }
         else:
-            print(f"Cache search failed with status {response.status_code}: {response.text}")
+            app.logger.error(f"Cache search failed with status {response.status_code}: {response.text}")
         # Calculate Redis search time for cache miss
         redis_search_time = time.time() - redis_search_start_time
-        print(f"Redis search processing time (cache miss): {redis_search_time:.6f}s (excluding embedding generation)")
+        app.logger.info(f"Redis search processing time (cache miss): {redis_search_time:.6f}s (excluding embedding generation)")
 
         # Track Redis search time for the specific embedding model
         latency_data[embedding_model]['redis'][timestamp].append(redis_search_time)
@@ -364,7 +408,7 @@ def search_cache(query, embedding_model="redis-langcache"):
             'redis_search_time': redis_search_time
         }
     except Exception as e:
-        print(f"Error searching cache: {e}")
+        app.logger.error(f"Error searching cache: {e}")
         return None
 
 def add_to_cache(query, response, embedding_model="redis-langcache"):
@@ -386,7 +430,7 @@ def add_to_cache(query, response, embedding_model="redis-langcache"):
     # Get the cache ID for the selected embedding model
     cache_id = cache_ids.get(embedding_model)
     if not cache_id:
-        print(f"No cache_id available for {embedding_model}, skipping cache addition")
+        app.logger.error(f"No cache_id available for {embedding_model}, skipping cache addition")
         if operations_log.get('query') == query:
             operations_log['steps'].append({
                 'step': 'ERROR',
@@ -400,7 +444,7 @@ def add_to_cache(query, response, embedding_model="redis-langcache"):
     # Get the base URL for the selected embedding model
     base_url = LANGCACHE_URLS.get(embedding_model)
     if not base_url:
-        print(f"No base URL available for {embedding_model}, skipping cache addition")
+        app.logger.error(f"No base URL available for {embedding_model}, skipping cache addition")
         if operations_log.get('query') == query:
             operations_log['steps'].append({
                 'step': 'ERROR',
@@ -414,11 +458,16 @@ def add_to_cache(query, response, embedding_model="redis-langcache"):
     url = f"{base_url}/v1/caches/{cache_id}/entries"
     payload = {
         "prompt": query,
-        "response": response
+        "response": response,
+        "attributes": {
+            "language": "en",
+            "topic": "ai"
+        },
+        "ttlMillis": 84003305
     }
 
     try:
-        print(f"Adding entry to cache for query: {query[:50]}... with model: {embedding_model}")
+        app.logger.info(f"Adding entry to cache for query: {query[:50]}... with model: {embedding_model}")
 
         # Log cache storage step if this is the same query
         if operations_log.get('query') == query and operations_log.get('embedding_model') == embedding_model:
@@ -432,20 +481,31 @@ def add_to_cache(query, response, embedding_model="redis-langcache"):
             })
 
         # Make the API call
-        cache_storage_start = time.time()
-        resp = requests.post(url, json=payload)
-        cache_storage_time = time.time() - cache_storage_start
-        print(f"Cache add response status: {resp.status_code}")
+        try:
+            cache_storage_start = time.time()
+            resp = retryer(rest_post, url, payload, 5)
+            cache_storage_time = time.time() - cache_storage_start
+        except requests.exceptions.Timeout:
+            app.logger.error(f"Timeout when calling {url}")
+            return None
+        except requests.exceptions.ConnectionError:
+            app.logger.error(f"Connection error when calling {url}")
+            return None
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"Error when calling {url}: {e}")
+            return None
+
+        app.logger.info(f"Cache add response status: {resp.status_code}")
 
         if resp.status_code == 200 or resp.status_code == 201:
             data = resp.json()
             entry_id = data.get('entryId')
-            print(f"Successfully added entry to cache with ID: {entry_id}")
+            app.logger.info(f"Successfully added entry to cache with ID: {entry_id}")
 
             # If we have an entry ID, store the query for n-gram analysis
             if entry_id:
                 cached_queries[entry_id] = query
-                print(f"Added query to n-gram cache with ID: {entry_id}")
+                app.logger.info(f"Added query to n-gram cache with ID: {entry_id}")
 
                 # Update cache storage step if this is the same query
                 if operations_log.get('query') == query and operations_log.get('embedding_model') == embedding_model:
@@ -464,7 +524,7 @@ def add_to_cache(query, response, embedding_model="redis-langcache"):
 
             return entry_id
         else:
-            print(f"Failed to add to cache: {resp.status_code} - {resp.text}")
+            app.logger.error(f"Failed to add to cache: {resp.status_code} - {resp.text}")
 
             # Log error if this is the same query
             if operations_log.get('query') == query and operations_log.get('embedding_model') == embedding_model:
@@ -478,7 +538,7 @@ def add_to_cache(query, response, embedding_model="redis-langcache"):
 
             return None
     except Exception as e:
-        print(f"Error adding to cache: {e}")
+        app.logger.error(f"Error adding to cache: {e}")
 
         # Log error if this is the same query
         if operations_log.get('query') == query and operations_log.get('embedding_model') == embedding_model:
@@ -493,11 +553,11 @@ def add_to_cache(query, response, embedding_model="redis-langcache"):
         return None
 
 # Initialize cache on startup
-try:
-    create_cache()
-    print("Cache initialization completed successfully.")
-except Exception as e:
-    print(f"Warning: Could not initialize cache: {e}")
+# try:
+#     create_cache()
+#     app.logger.info("Cache initialization completed successfully.")
+# except Exception as e:
+#     app.logger.error(f"Warning: Could not initialize cache: {e}")
 
 @app.route('/')
 def index():
@@ -515,7 +575,7 @@ def process_query():
     llm_model = data.get('llm_model', 'gemini-1.5-flash')
     embedding_model = data.get('embedding_model', 'redis-langcache')
 
-    print(f"Processing query: '{query}', llm_model: {llm_model}, embedding_model: {embedding_model}")
+    app.logger.info(f"Processing query: '{query}', llm_model: {llm_model}, embedding_model: {embedding_model}")
 
     # Always use the semantic cache workflow
     cache_start_time = time.time()
@@ -534,8 +594,8 @@ def process_query():
     # This includes embedding generation + searching in Redis + returning results
 
     # For debugging
-    print(f"Total cache time: {cache_time:.4f}s, Embedding time: {embedding_time:.4f}s, Redis search time: {redis_search_time:.6f}s")
-    print(f"Percentage breakdown - Embedding: {(embedding_time/cache_time)*100 if cache_time else 0:.2f}%, Redis search: {(redis_search_time/cache_time)*100 if cache_time else 0:.2f}%, Other: {((cache_time-embedding_time-redis_search_time)/cache_time)*100 if cache_time else 0:.2f}%")
+    app.logger.info(f"Total cache time: {cache_time:.4f}s, Embedding time: {embedding_time:.4f}s, Redis search time: {redis_search_time:.6f}s")
+    app.logger.info(f"Percentage breakdown - Embedding: {(embedding_time/cache_time)*100 if cache_time else 0:.2f}%, Redis search: {(redis_search_time/cache_time)*100 if cache_time else 0:.2f}%, Other: {((cache_time-embedding_time-redis_search_time)/cache_time)*100 if cache_time else 0:.2f}%")
 
     # Track total cache operation latency for the specific embedding model
     timestamp = get_current_timestamp()
@@ -544,7 +604,7 @@ def process_query():
     if cached_result and 'response' in cached_result:
         # We found a similar query in the cache
         similarity = cached_result.get('similarity', 'N/A')
-        print(f"Cache hit! Returning cached response with similarity {similarity}")
+        app.logger.info(f"Cache hit! Returning cached response with similarity {similarity}")
         # Track cache hit for the specific embedding model
         latency_data[embedding_model]['cache_hits'] += 1
 
@@ -581,12 +641,18 @@ def process_query():
         })
 
     # No cache hit, need to call the LLM and store the result
-    print("Cache miss. Calling LLM and storing result...")
+    app.logger.info("Cache miss. Calling LLM and storing result...")
     # Track cache miss for the specific embedding model
     latency_data[embedding_model]['cache_misses'] += 1
 
     llm_start_time = time.time()
-    response = generate_gemini_response(query, llm_model)
+    if llm_model == 'gemini-1.5-flash':
+        response = generate_gemini_response(query, llm_model)
+    elif llm_model == 'gpt-4o':
+        response = generate_openai_response(query, llm_model)
+    else:
+        app.logger.error(f"Unknown llm model: {llm_model}")
+        response = f"I do not support the model {llm_model}"
     llm_time = time.time() - llm_start_time
 
     # Calculate total time (cache search + LLM)
@@ -623,7 +689,7 @@ def process_query():
     try:
         add_to_cache(query, response, embedding_model)
     except Exception as e:
-        print(f"Error adding response to cache: {e}")
+        app.logger.error(f"Error adding response to cache: {e}")
 
     # Log the cache miss
     log_manager.log_query(
@@ -642,17 +708,36 @@ def process_query():
 def generate_gemini_response(query, model_name="gemini-1.5-flash"):
     """Generate a response using Google's Gemini LLM"""
     try:
+        if not genai_client:
+            return "Gemini has not been configured for this demo. Please add a GCP API key."
         # Use Google Gemini
-        print(f"Calling Gemini API with query: {query}, model: {model_name}")
+        app.logger.info(f"Calling Gemini API with query: {query}, model: {model_name}")
         # Call the actual Gemini API
         response = genai_client.models.generate_content(
             model=model_name,
             contents=[query]
         )
-        print(f"Gemini API response received from model: {model_name}")
+        app.logger.info(f"Gemini API response received from model: {model_name}")
         return response.text
     except Exception as e:
-        print(f"Error calling LLM API: {e}")
+        app.logger.error(f"Error calling LLM API: {e}")
+        # Fallback to a generic response if there's an error
+        return f"I encountered an issue processing your query about '{query}'. Please try again later."
+
+def generate_openai_response(query, model_name="gpt-4o"):
+    """Generate a response using OpenAI's OpenAI API"""
+    try:
+        if not openai_client:
+            return "OpenAI has not been configured for this demo. Please add an OpenAI API key."
+        response = openai_client.responses.create(
+            model="gpt-4o",
+            instructions="You are a helpful bot that answers general questions.",
+            input=query,
+        )
+        app.logger.info(f"OpenAI API response received from model: {model_name}")
+        return response.output_text
+    except Exception as e:
+        app.logger.error(f"Error calling LLM API: {e}")
         # Fallback to a generic response if there's an error
         return f"I encountered an issue processing your query about '{query}'. Please try again later."
 
@@ -759,11 +844,11 @@ def init_cache():
 
 if __name__ == '__main__':
     # Create caches for each embedding model
-    try:
-        create_cache()
-        print("Cache initialization completed successfully.")
-    except Exception as e:
-        print(f"Warning: Could not initialize cache: {e}")
+    # try:
+    #     create_cache()
+    #     app.logger.info("Cache initialization completed successfully.")
+    # except Exception as e:
+    #     app.logger.error(f"Warning: Could not initialize cache: {e}")
 
     # Run the application with debug mode disabled to prevent double initialization
     app.run(debug=False, port=5001)

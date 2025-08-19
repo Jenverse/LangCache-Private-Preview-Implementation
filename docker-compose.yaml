@@ -1,23 +1,20 @@
 services:
-  metadata-db:
+  cache-db1:
     image: redis/redis-stack:latest
-    container_name: metadata-db
     ports:
       - "6379:6379"
     volumes:
-      - metadata_db_data:/data
+      - cache_db1_data:/data
 
-  cache:
+  cache-db2:
     image: redis/redis-stack:latest
-    container_name: cache
     ports:
       - "16379:6379"
     volumes:
-      - cache_data:/data
+      - cache_db2_data:/data
 
   ollama:
     image: ollama/ollama:latest
-    container_name: ollama
     volumes:
       - ollama_data:/root/.ollama
 
@@ -27,72 +24,50 @@ services:
     depends_on:
       - ollama
 
-  langcache-ollama:
-    image: "artifactory.dev.redislabs.com:443/cloud-docker-dev-local/ai-services/langcache:0.0.7"
-    container_name: langcache-ollama
+  embeddings-api:
+    image: "langcache-embeddings-api:0.0.3"
+    ports:
+      - "8081:11434"
+
+  langcache-provisioner:
+    image: "langcache:0.0.14"
+    entrypoint: /provision-cache-index
+    command: -config=/config.yaml -ignore
     depends_on:
-      - cache
-      - metadata-db
+      - cache-db1
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+
+  langcache-redis:
+    image: "langcache:0.0.14"
+    entrypoint: /server
+    command: --config=/config.yaml
+    depends_on:
+      - cache-db1
+      - langcache-provisioner
+      - embeddings-api
       - ollama
       - model-loader
     ports:
       - "8080:8080"
-    environment:
-      METADATABASE_URLS: redis://metadata-db:6379
-      EMBEDDINGS_CATALOG_JSON: "{\"defaultModel\":\"ollama-bge\",\"models\":{\"ollama-bge\":{\"apiKey\":\"not_needed\",\"baseUrl\":\"http://ollama:11434\",\"dimensions\":1024,\"name\":\"bge-m3\"}}}"
-      LOGGING_LEVEL_ROOT: info
-
-  langcache-redis:
-    image: "artifactory.dev.redislabs.com:443/cloud-docker-dev-local/ai-services/langcache:0.0.7"
-    container_name: langcache-redis
-    depends_on:
-      - cache
-      - metadata-db
-      - embeddings
-    ports:
-      - "8081:8080"
-    environment:
-      METADATABASE_URLS: redis://metadata-db:6379
-      EMBEDDINGS_CATALOG_JSON: "{\"defaultModel\":\"redis-langcache\",\"models\":{\"redis-langcache\":{\"apiKey\":\"${HF_TOKEN}\",\"baseUrl\":\"http://embeddings:8080\",\"dimensions\":384,\"name\":\"redis-langcache-embed-v1\"}}}"
-      LOGGING_LEVEL_ROOT: info
-    env_file:
-      - .env
-
-  langcache-openai:
-    image: "artifactory.dev.redislabs.com:443/cloud-docker-dev-local/ai-services/langcache:0.0.7"
-    container_name: langcache-openai
-    depends_on:
-      - cache
-      - metadata-db
-      - embeddings
-    ports:
-      - "8082:8080"
-    environment:
-      METADATABASE_URLS: redis://metadata-db:6379
-      EMBEDDINGS_CATALOG_JSON: "{\"defaultModel\":\"openai-embeddings\",\"models\":{\"openai-embeddings\":{\"apiKey\":\"${OPENAI_API_KEY}\",\"baseUrl\":\"https://api.openai.com\",\"dimensions\":1536,\"name\":\"text-embedding-3-small\"}}}"
-      LOGGING_LEVEL_ROOT: info
-    env_file:
-      - .env
+    volumes:
+      - ./config.yaml:/config.yaml:ro
 
   llm-app:
     build: ./llm-app
     container_name: llm-app
+    image: llm-app:latest
     ports:
       - "5001:8080"
     depends_on:
-      - langcache-openai
-    env_file:
-      - .env
-
-  embeddings:
-    build: ./langcache-operations/embeddings
-    container_name: embeddings
-    ports:
-      - "8083:8080"
+      - langcache-redis
+      - cache-db1
+      - ollama
+      - embeddings-api
     env_file:
       - .env
 
 volumes:
   ollama_data:
-  metadata_db_data:
-  cache_data:
+  cache_db1_data:
+  cache_db2_data:

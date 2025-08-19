@@ -1,0 +1,49 @@
+server:
+  port: 8080
+metadata:
+  loader: static
+  caches:
+    - id: redisCache
+      default_search_threshold: 0.85
+      urls:
+        - "redis://cache-db1:6379"
+      index: redisLangcacheIndex
+      attributes:
+        - "language"
+        - "topic"
+      model:
+        type: openai
+        name: langcache-embed-v1
+        dimensions: 768
+        url: http://embeddings-api:11434
+        key: ''
+    - id: ollamaCache
+      default_search_threshold: 0.85
+      urls:
+        - "redis://cache-db1:6379"
+      index: ollamaLangcacheIndex
+      attributes:
+        - "language"
+        - "topic"
+      model:
+        type: openai
+        name: bge-m3
+        dimensions: 1024
+        url: http://ollama:11434
+        key: ''
+    - id: openaiCache
+      default_search_threshold: 0.85
+      urls:
+        - "redis://cache-db1:6379"
+      index: openaiLangcacheIndex
+      attributes:
+        - "language"
+        - "topic"
+      model:
+        type: openai
+        name: text-embedding-3-small
+        dimensions: 1536
+        key: '{{ OPENAI_API_KEY }}'
+auth:
+  disable: true
+profile: prod

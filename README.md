@@ -4,35 +4,53 @@
 [![GitHub stars](https://img.shields.io/github/stars/redis/langcache-demo)](https://github.com/redis/langcache-demo/stargazers)
 [![GitHub issues](https://img.shields.io/github/issues/redis/langcache-demo)](https://github.com/redis/langcache-demo/issues)
 
+## Prerequisites
+- Python 3.10
+- uv ([Install Guide](https://docs.astral.sh/uv/getting-started/installation/))
+- Docker CLI
+- Docker Compose v2
+- Get the container distribution from your account team (see below)
+
+### Import Containers
+```sh
+tar xzvf langcache-all-20250714-1446.tar.gz
+```
+```sh
+docker load -i langcache-docker-image-0.0.14.tar.gz
+```
+```sh
+docker load -i langcache-embeddings-api-docker-image-0.0.3.tar.gz
+```
+
 ## Quick Setup of this app if you want to test out LangCache
 
 **This repository demonstrates how to integrate LangCache with your applications. While you can experiment with this demo app, the primary purpose is to showcase how to implement LangCache in your own projects. So you can go to the next section to see LangCache implementation **
 
-1. Clone this repository:
-   ```sh
-   git clone https://github.com/redis/langcache-demo.git
-   cd langcache-demo
-   ```
+1. Clone this repository
 
 2. Run the setup script:
    ```sh
-   ./setup.sh
+   uv sync
    ```
-
-3. Edit the `.env` file with your API keys:
-   ```
-   OPENAI_API_KEY=your_openai_api_key_here
-   HF_TOKEN=your_huggingface_token_here
-   GEMINI_API_KEY=your_gemini_api_key_here
-   ```
-
-4. Start the services:
    ```sh
-   docker-compose up -d langcache-redis embeddings llm-app
+   . .venv/bin/activate
+   ```
+   ```sh
+   uv run demo setup
    ```
 
-5. Open the demo application:
+3. Start the services:
+   ```sh
+   uv run demo start
+   ```
+
+4. Open the demo application:
    [http://localhost:5001](http://localhost:5001)
+
+5. Stop the services:
+   ```sh
+   uv run demo stop
+   ```
 
 ## LangCache Overview
 

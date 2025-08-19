@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-app"
+version = "0.0.1"
+requires-python = ">=3.10"
+dependencies = [
+    "flask==2.0.1",
+    "Werkzeug<3.0.0",
+    "python-dotenv==1.1.0",
+    "google-genai==1.9.0",
+    "requests==2.31.0",
+    "gunicorn==21.2.0",
+    "Jinja2<3.1.0",
+    "itsdangerous<2.1.0",
+    "click<8.1.0",
+    "markupsafe<2.1.0",
+    "openai>=1.97.0",
+    "tenacity>=9.1.2",
+]
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["static", "templates", "tests"]

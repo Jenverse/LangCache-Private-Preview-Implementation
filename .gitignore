@@ -116,3 +116,6 @@ cache_operations.log
 *.tmp
 *.bak
 *.backup
+
+# Config file
+config.yaml

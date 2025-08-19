@@ -21,7 +21,10 @@ document.addEventListener('DOMContentLoaded', function() {
 
     function handleSubmit() {
         const query = queryInput.value.trim();
-        if (!query) return;
+        let isRequestInProgress = false;
+        if (!query || isRequestInProgress) return;
+
+        isRequestInProgress = true;
 
         // Always clear previous messages for each new query
         cachedChat.innerHTML = '';
@@ -40,6 +43,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
         // Start timer
         const cachedStartTime = performance.now();
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
 
         // Make request to the endpoint
         fetch('/query', {
@@ -52,12 +57,18 @@ document.addEventListener('DOMContentLoaded', function() {
                 use_cache: true,
                 llm_model: llmModelSelect.value,
                 embedding_model: embeddingModelSelect.value
+            }),
+            signal: controller.signal
             })
-        })
-        .then(response => response.json())
-        .then(data => {
+            .then(response => {
+                clearTimeout(timeoutId);
+                return response.json();
+            })
+            .then(data => {
             // Remove loading message
-            cachedChat.removeChild(cachedLoadingMsg);
+            if (cachedLoadingMsg && cachedLoadingMsg.parentNode) {
+                cachedChat.removeChild(cachedLoadingMsg);
+            }
 
             // Use server-reported time for more accurate demonstration
             const timeTaken = data.time_taken.toFixed(2);
@@ -69,9 +80,14 @@ document.addEventListener('DOMContentLoaded', function() {
             addResponseMessage(cachedChat, data.response, data.source === 'cache', data.similarity);
         })
         .catch(error => {
-            cachedChat.removeChild(cachedLoadingMsg);
+            if (cachedLoadingMsg && cachedLoadingMsg.parentNode) {
+                cachedChat.removeChild(cachedLoadingMsg);
+            }
             addErrorMessage(cachedChat, 'Error with semantic cache: ' + error.message);
             console.error('Error with semantic cache:', error);
+        })
+        .finally(() => {
+            isRequestInProgress = false;
         });
 
         // Clear input
